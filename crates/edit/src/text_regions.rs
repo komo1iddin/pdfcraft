@@ -105,6 +105,10 @@ fn group_layout(lines: &[TextLine], mixed: bool) -> Vec<TextBlock> {
             let tol = prev.size.max(first.size).max(1.0);
             let aligned =
                 (pr[0] - frame[0]).abs() < tol || ((pr[0] + pr[2] - frame[0] - frame[2]) / 2.0).abs() < tol || (pr[2] - frame[2]).abs() < tol;
+            // A paragraph PdfCraft marked keeps all its rows, wherever they are.
+            if prev.edit.is_some() && same_plane(prev, first) {
+                return true;
+            }
             // OCR lines stay apart: the scan fixes where each one is, so they never rewrap together.
             (!mixed || !(invisible(prev) || invisible(first)))
                 && (mixed || same_style(prev, first))
@@ -129,6 +133,9 @@ fn group_layout(lines: &[TextLine], mixed: bool) -> Vec<TextBlock> {
                 lines: Vec::new(),
                 rows: Vec::new(),
                 invisible: true,
+                id: first.edit.map(|m| m.id),
+                width: first.edit.and_then(|m| m.width),
+                align: first.edit.and_then(|m| m.align),
             });
         }
         let Some(block) = blocks.last_mut() else { continue };
@@ -164,6 +171,13 @@ fn group_layout(lines: &[TextLine], mixed: bool) -> Vec<TextBlock> {
         block.text.push_str(row_text.trim_matches(paragraph_separator));
         block.rect = union(block.rect, rect);
         block.rows.push(row);
+    }
+    // An id copied along with its paragraph belongs to the first; the others read as unmarked.
+    let mut ids = std::collections::HashSet::new();
+    for block in &mut blocks {
+        if block.id.is_some_and(|id| !ids.insert(id)) {
+            (block.id, block.width, block.align) = (None, None, None);
+        }
     }
     blocks
 }

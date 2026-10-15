@@ -4249,3 +4249,50 @@ fn japanese_paragraphs_wrap_between_characters_without_closing_marks_at_a_row_st
         }
     }
 }
+
+#[test]
+fn a_marked_paragraph_keeps_its_rows_and_never_joins_a_neighbour() {
+    // Two rows far apart and not lined up: geometry alone makes them two paragraphs, and joins the
+    // row below to the second. The marker says they are one paragraph, apart from that row.
+    let content = "/Span <</PCEdit <</Id 7 /W 300 /Align /Justify>>>> BDC \
+                   BT /F1 12 Tf 72 700 Td (First marked row) Tj ET BT /F1 12 Tf 200 640 Td (Far second row) Tj ET EMC \
+                   BT /F1 12 Tf 200 626 Td (Unmarked neighbour) Tj ET";
+    let blocks = text::text_blocks(&text_page(content), 0).unwrap();
+    let texts: Vec<_> = blocks.iter().map(|b| b.text.as_str()).collect();
+    assert_eq!(texts, ["First marked row Far second row", "Unmarked neighbour"]);
+    assert_eq!((blocks[0].id, blocks[0].width, blocks[0].align), (Some(7), Some(300.0), Some(added::Align::Justify)));
+    assert_eq!((blocks[1].id, blocks[1].width, blocks[1].align), (None, None, None));
+    // Split between two content streams, which are one stream in pieces.
+    let doc = split_page(
+        "/Span <</PCEdit <</Id 2>>>> BDC BT /F1 12 Tf 72 700 Td (First marked row) Tj ET",
+        "BT /F1 12 Tf 200 640 Td (Far second row) Tj ET EMC",
+    );
+    let blocks = text::text_blocks(&doc, 0).unwrap();
+    assert_eq!(blocks.len(), 1, "{blocks:?}");
+    assert_eq!((blocks[0].id, blocks[0].width, blocks[0].align), (Some(2), None, None));
+}
+
+#[test]
+fn malformed_and_repeated_paragraph_markers_are_no_markers() {
+    for marker in [
+        "/Span <</PCEdit <</Id -1>>>>",
+        "/Span <</PCEdit <</Id 3 /Align /Diagonal>>>>",
+        "/Span <</PCEdit <</Id 3 /W (wide)>>>>",
+        "/Span <</PCEdit <</Id 3 /W 0>>>>",
+        "/Span <</PCEdit 5>>",
+        "/Artifact <</PCEdit <</Id 3>>>>",
+    ] {
+        let content = format!("{marker} BDC BT /F1 12 Tf 72 700 Td (First row) Tj ET BT /F1 12 Tf 200 640 Td (Far second row) Tj ET EMC");
+        let blocks = text::text_blocks(&text_page(&content), 0).unwrap();
+        assert_eq!(blocks.len(), 2, "{marker}: grouped by geometry");
+        assert!(blocks.iter().all(|b| b.id.is_none()), "{marker}");
+    }
+    // A paragraph copied with its marker: the first keeps the id.
+    let content = "/Span <</PCEdit <</Id 4 /Align /Center>>>> BDC BT /F1 12 Tf 72 700 Td (Original) Tj ET EMC \
+                   /Span <</PCEdit <</Id 4 /Align /Center>>>> BDC BT /F1 12 Tf 72 500 Td (Copy) Tj ET EMC";
+    let blocks = text::text_blocks(&text_page(content), 0).unwrap();
+    assert_eq!(
+        blocks.iter().map(|b| (b.text.as_str(), b.id, b.align)).collect::<Vec<_>>(),
+        [("Original", Some(4), Some(added::Align::Center)), ("Copy", None, None)]
+    );
+}

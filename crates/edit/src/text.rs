@@ -58,6 +58,8 @@ pub struct TextLine {
     origin: Origin,
     /// Explicit marked-content scope (when present); distinct scopes must not be guessed into one paragraph.
     scope: Option<usize>,
+    /// The paragraph marker the line is in, if a rewrite wrote one (see [`EditMark`]).
+    edit: Option<EditMark>,
     /// Right-to-left `/ActualText` already supplies typing order; glyph text still needs bidi
     /// recovery. Left-to-right ActualText (e.g. a Latin ligature) joins its line as usual.
     logical_order: bool,
@@ -267,6 +269,48 @@ pub struct TextBlock {
     /// Every line is invisible text (rendering mode 3): an OCR layer over a scanned image, whose
     /// pixels show the words. A rewrite draws the new text visibly (see [`BlockStyle::cover`]).
     pub invisible: bool,
+    /// The paragraph's id on its page, its width in user space and its alignment, when a rewrite
+    /// marked it (see [`EditMark`]).
+    pub id: Option<u32>,
+    pub width: Option<f64>,
+    pub align: Option<crate::added::Align>,
+}
+
+/// A paragraph PdfCraft rewrote, as the marked-content sequence around it records it:
+/// `/Span <</PCEdit <</Id 7 /W 222.1 /Align /Justify>>>> BDC … EMC` (ISO 32000-2 §14.6). The
+/// sequence has no `/MCID`, so it isn't part of the structure tree, and other readers ignore the
+/// private key. Its rows form one paragraph, which never joins another.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct EditMark {
+    /// Unique among the page's markers.
+    pub id: u32,
+    /// The width its rows were wrapped to, in the page's default user space.
+    pub width: Option<f64>,
+    pub align: Option<crate::added::Align>,
+}
+
+/// The paragraph marker `op` opens, if it is one: a malformed one is no marker.
+fn edit_mark(op: &Op) -> Option<EditMark> {
+    if !op.is("BDC") || op.name(0) != Some(b"Span") {
+        return None;
+    }
+    let mark = op.operands.get(1)?.as_dict()?.get(b"PCEdit")?.as_dict()?;
+    let id = u32::try_from(mark.get(b"Id")?.as_int()?).ok().filter(|id| *id < 1 << 31)?;
+    let width = match mark.get(b"W") {
+        None => None,
+        Some(w) => Some(w.as_f64().filter(|w| w.is_finite() && *w > 0.0 && *w <= 14_400.0)?),
+    };
+    let align = match mark.get(b"Align") {
+        None => None,
+        Some(a) => Some(match a.as_name()? {
+            b"Left" => crate::added::Align::Left,
+            b"Center" => crate::added::Align::Center,
+            b"Right" => crate::added::Align::Right,
+            b"Justify" => crate::added::Align::Justify,
+            _ => return None,
+        }),
+    };
+    Some(EditMark { id, width, align })
 }
 
 impl TextBlock {
@@ -655,6 +699,7 @@ struct Shown {
     visual_order: bool,
     decodable: bool,
     scope: Option<usize>,
+    edit: Option<EditMark>,
     logical_order: bool,
     actual_text: bool,
 }
@@ -703,6 +748,8 @@ struct Carry {
     ts: Ts,
     stack: Vec<Ts>,
     marked: Vec<Option<usize>>,
+    /// The paragraph marker each open marked-content sequence is in (see [`EditMark`]).
+    edits: Vec<Option<EditMark>>,
 }
 
 impl Carry {
@@ -720,7 +767,7 @@ impl Carry {
             rise: 0.0,
             render_mode: 0,
         };
-        Carry { ts, stack: Vec::new(), marked: Vec::new() }
+        Carry { ts, stack: Vec::new(), marked: Vec::new(), edits: Vec::new() }
     }
 }
 
@@ -743,14 +790,19 @@ fn interpret(
     let (mut tm, mut tlm) = (Matrix::IDENTITY, Matrix::IDENTITY);
     let mut bt = 0usize;
     let mut marked = std::mem::take(&mut carry.marked);
+    let mut edits = std::mem::take(&mut carry.edits);
     let mut actual: Vec<Option<(usize, usize, String)>> = Vec::new();
     for (i, op) in ops.iter().enumerate() {
         match op.op.as_slice() {
             b"BMC" | b"BDC" if marked.len() < 256 => {
                 // Marked text paragraphs/headings are authoritative boundaries. Ignore
                 // artifacts and inner spans, which inherit their enclosing region.
-                let region = matches!(op.name(0), Some(b"P" | b"H" | b"H1" | b"H2" | b"H3" | b"H4" | b"H5" | b"H6" | b"LI" | b"TD" | b"TH"));
+                // So is a paragraph PdfCraft rewrote.
+                let mark = edit_mark(op);
+                let region =
+                    mark.is_some() || matches!(op.name(0), Some(b"P" | b"H" | b"H1" | b"H2" | b"H3" | b"H4" | b"H5" | b"H6" | b"LI" | b"TD" | b"TH"));
                 marked.push(if region { Some(i) } else { marked.last().copied().flatten() });
+                edits.push(mark.or(edits.last().copied().flatten()));
                 let logical = op.operands.get(1).and_then(Object::as_dict).and_then(|d| d.get(b"ActualText")).and_then(|s| match s {
                     Object::String(s) if s.bytes.len() <= 4_000_000 => Some(s.to_text()),
                     _ => None,
@@ -759,6 +811,7 @@ fn interpret(
             }
             b"EMC" => {
                 marked.pop();
+                edits.pop();
                 if let Some(Some((start, open, logical))) = actual.pop() {
                     let tail = out.split_off(start.min(out.len()));
                     let mut items = tail.into_iter();
@@ -978,6 +1031,7 @@ fn interpret(
                     visual_order: m.visual_order,
                     decodable,
                     scope: marked.last().copied().flatten(),
+                    edit: edits.last().copied().flatten(),
                     logical_order: false,
                     actual_text: false,
                 });
@@ -988,6 +1042,7 @@ fn interpret(
     carry.ts = ts;
     carry.stack = stack;
     carry.marked = marked;
+    carry.edits = edits;
     out
 }
 
@@ -1063,6 +1118,7 @@ pub fn text_lines(doc: &Document, page: usize) -> Result<Vec<TextLine>, EditErro
                 face: s.face.clone(),
                 stream: si,
                 scope: s.scope,
+                edit: s.edit,
                 logical_order: s.logical_order,
                 actual_text: s.actual_text,
                 ops: std::iter::once(s.op).chain(s.extra_ops.iter().copied()).collect(),
@@ -1150,6 +1206,7 @@ fn add_shown(lines: &mut Vec<TextLine>, last: &mut Option<Pen>, s: Shown, stream
             face: s.face.clone(),
             stream,
             scope: s.scope,
+            edit: s.edit,
             logical_order: s.logical_order,
             actual_text: s.actual_text,
             ops: std::iter::once(s.op).chain(s.extra_ops.iter().copied()).collect(),
@@ -1260,7 +1317,7 @@ fn reading_lines(doc: &Document, page: usize) -> Result<Vec<TextLine>, EditError
         let Some(form) = form_call(w.doc, resources, name, ts.ctm, &w.path, &mut w.visits) else { return };
         let ops = parse(&form.data).ops;
         // The form starts with the graphics state at its `Do`, its own matrix applied.
-        let mut carry = Carry { ts: Ts { ctm: form.ctm, ..ts }, stack: Vec::new(), marked: Vec::new() };
+        let mut carry = Carry { ts: Ts { ctm: form.ctm, ..ts }, stack: Vec::new(), marked: Vec::new(), edits: Vec::new() };
         let stream = w.next_stream;
         w.next_stream = w.next_stream.saturating_add(1);
         if let Some(r) = form.obj {
